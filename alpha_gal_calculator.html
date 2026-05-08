@@ -1,0 +1,1135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>α-gal syndrome and the small-animal replacement problem</title>
+
+<!-- Tailwind play CDN (fine for sharing; logs a one-time prod warning) -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- React 18 -->
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+
+<!-- Recharts (peer-depends on prop-types) -->
+<script crossorigin src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+<script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.min.js"></script>
+
+<!-- Babel standalone for in-browser JSX compilation -->
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+
+<style>
+  html, body { margin: 0; padding: 0; }
+  /* Hide everything until React mounts so users don't see raw JSX flash */
+  #root:empty::before {
+    content: "loading…";
+    display: block;
+    padding: 4rem 2rem;
+    text-align: center;
+    font-family: Georgia, serif;
+    font-style: italic;
+    color: #5a4a36;
+    background: #f3ecdd;
+    min-height: 100vh;
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+// Pull React + Recharts off the global window.
+const { useState, useEffect, useMemo } = React;
+const {
+  BarChart, Bar, XAxis, YAxis, ReferenceLine,
+  ResponsiveContainer, Cell, Tooltip, LabelList
+} = Recharts;
+
+// ─────────────────────────────────────────────────────────────────────────
+// DEFAULTS — sources noted in §4 below.
+//
+//  consumption  : kg / person / year (USDA ERS 2024–25, NOAA/NFI for seafood)
+//  indPerKg     : animals slaughtered per kg of EDIBLE product
+//                 (dairy: per-kg-of-milk-equivalent over a cow's lifetime)
+//  lifespan     : days from birth to slaughter
+//                 (dairy cow: full productive lifespan ≈ 5 yr)
+//  welfareRange : Rethink Priorities, "Welfare Range Estimates" (Fischer 2023),
+//                 50th-percentile, sentience-adjusted, on a 0–1 scale where
+//                 1 = human welfare range. Cows & turkey are not in RP's
+//                 11-species set; defaults follow RP's own statement that
+//                 vertebrates likely fall within ~2× of one another.
+//
+//  suffering_per_kg = lifespan × indPerKg × welfareRange
+//   → interpretable as "human-DALY-equivalent days of farm life per kg",
+//     under the (extreme) assumption that the animal experiences its
+//     full negative welfare range throughout life. Adjust welfareRange
+//     downward if you want a less pessimistic baseline.
+// ─────────────────────────────────────────────────────────────────────────
+
+const DEFAULTS = {
+  beef:         { c: 26.3,  ind: 0.00472, life:  400, wr: 0.500 },
+  pork:         { c: 22.7,  ind: 0.01540, life:  183, wr: 0.515 },
+  dairy:        { c: 300,   ind: 3.33e-5, life: 1825, wr: 0.500 },
+  chicken:      { c: 46.3,  ind: 0.5260,  life:   42, wr: 0.332 },
+  turkey:       { c:  5.9,  ind: 0.1042,  life:  126, wr: 0.332 },
+  eggs:         { c: 14.0,  ind: 0.0500,  life:  504, wr: 0.332 },
+  shrimp:       { c:  2.7,  ind: 40.00,   life:  180, wr: 0.031 },
+  otherSeafood: { c:  6.4,  ind: 0.500,   life:  720, wr: 0.073 },
+};
+
+// derived helper
+const sufferingPerKg = (p) => p.life * p.ind * p.wr;
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cost-effectiveness anchors (ACE / Welfare Footprint).
+// Both are proportional to RP welfare ranges, so re-using the user's WR
+// values keeps the framework consistent end-to-end.
+//
+//   SWP HSI:   ~4   DALY / $ at WR = 1   (≈ 0.13 DALY/$ at default shrimp WR)
+//                   = ACE's 48 SADs/$ ÷ 365.25 ÷ RP shrimp WR (0.031).
+//                   See ACE charity review of Shrimp Welfare Project.
+//   Cage-free: ~0.5 DALY / $ at WR = 1   (≈ 0.17 DALY/$ at default chicken WR)
+//                   ≈ THL-conservative: 2 hens/$ × 1.2 yr × 25%-of-WR averted.
+//                   Higher published estimates exist (Šimčikas mean ≈ 42 hens/$
+//                   ⇒ closer to 5 DALY/$ at WR=1 with the same 25% assumption);
+//                   we default to the conservative end.
+//
+// individualsPerDollar feeds the per-individual sanity check in §3:
+// an intervention can't avert more DALYs per animal than that animal
+// experiences in its whole lifetime under our flat WR scaling. Defaults:
+//   SWP:       10,000 shrimp/$ (ACE CEA mid-range, 9,282–11,602)
+//   Cage-free:    42 hens/$    (Šimčikas 2019 mean of 9–120/$ range)
+// ─────────────────────────────────────────────────────────────────────────
+const CE_DEFAULTS = {
+  swpAtWR1:            4.0,    // DALY / $ at WR_shrimp  = 1
+  cfAtWR1:             0.5,    // DALY / $ at WR_chicken = 1
+  swpShrimpPerDollar:  10000,  // shrimp helped per $ (ACE CEA)
+  cfHensPerDollar:     42,     // hens helped per $   (Šimčikas 2019)
+};
+const DAYS_PER_DALY = 365.25;
+
+const SERIF = "'Cormorant Garamond', 'EB Garamond', Georgia, serif";
+const MONO  = "'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace";
+
+const COLOR = {
+  bg:        '#f3ecdd',
+  paper:     '#faf5e6',
+  ink:       '#2a1f15',
+  inkSoft:   '#5a4a36',
+  rule:      '#cdb98f',
+  ruleSoft:  '#e6d9b6',
+  avoided:   '#5b7a55',
+  added:     '#a04a30',
+  addedHot:  '#7a1c12',
+  highlight: '#c64d2c',
+};
+
+// ─────────────────────────────────────────────────────────────────────────
+function AlphaGalCalculator() {
+
+  useEffect(() => {
+    const id = 'agc-fonts';
+    if (document.getElementById(id)) return;
+    const link = document.createElement('link');
+    link.id = id;
+    link.rel = 'stylesheet';
+    link.href = 'https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=JetBrains+Mono:wght@400;500;700&display=swap';
+    document.head.appendChild(link);
+  }, []);
+
+  // canonical default: 110,000 = lab-diagnosed cumulative US cases 2010–2022
+  // (Binder/Salzer, MMWR 2023). "450,000" is the CDC extrapolation upper bound.
+  const [agsCount,    setAgsCount]    = useState(110000);
+  const [replaceRate, setReplaceRate] = useState(50);
+  const [includeEggs, setIncludeEggs] = useState(false);
+  const [showCoefs,   setShowCoefs]   = useState(false);
+  const [showMethod,  setShowMethod]  = useState(false);
+
+  const [params, setParams] = useState(DEFAULTS);
+  const [ce, setCe] = useState(CE_DEFAULTS);
+
+  // ─── core computation ────────────────────────────────────────────────
+  const calc = useMemo(() => {
+    const r = replaceRate / 100;
+    const beefPork = params.beef.c + params.pork.c;
+    const replKg   = beefPork * r;
+    const eggsC    = includeEggs ? params.eggs.c : 0;
+    const allowed  = params.chicken.c + params.turkey.c + eggsC
+                   + params.shrimp.c  + params.otherSeafood.c;
+
+    const spk = Object.fromEntries(
+      Object.entries(params).map(([k, v]) => [k, sufferingPerKg(v)])
+    );
+
+    // per-person change in suffering-days / year
+    const ch = {
+      beef:        -params.beef.c  * spk.beef,
+      pork:        -params.pork.c  * spk.pork,
+      dairy:       -params.dairy.c * spk.dairy,
+      chicken:      (params.chicken.c      / allowed) * replKg * spk.chicken,
+      turkey:       (params.turkey.c       / allowed) * replKg * spk.turkey,
+      eggs:         (eggsC                 / allowed) * replKg * spk.eggs,
+      shrimp:       (params.shrimp.c       / allowed) * replKg * spk.shrimp,
+      otherSeafood: (params.otherSeafood.c / allowed) * replKg * spk.otherSeafood,
+    };
+    const avoided   = ch.beef + ch.pork + ch.dairy;
+    const added     = ch.chicken + ch.turkey + ch.eggs + ch.shrimp + ch.otherSeafood;
+    const perPerson = avoided + added;
+    const total     = perPerson * agsCount;
+
+    // break-even replacement rate
+    const wsuff = (params.chicken.c      * spk.chicken +
+                   params.turkey.c       * spk.turkey  +
+                   eggsC                 * spk.eggs    +
+                   params.shrimp.c       * spk.shrimp  +
+                   params.otherSeafood.c * spk.otherSeafood) / allowed;
+    const breakEven = Math.abs(avoided) / (beefPork * wsuff) * 100;
+
+    // offset-cost calculation: convert suffering-days → DALYs → $
+    const dalys = Math.max(0, total) / DAYS_PER_DALY;
+    const swpDalyPerDollar = ce.swpAtWR1 * params.shrimp.wr;
+    const cfDalyPerDollar  = ce.cfAtWR1  * params.chicken.wr;
+    const swpCost = swpDalyPerDollar > 0 ? dalys / swpDalyPerDollar : Infinity;
+    const cfCost  = cfDalyPerDollar  > 0 ? dalys / cfDalyPerDollar  : Infinity;
+
+    // per-individual sanity check: DALYs averted per animal vs lifetime DALYs
+    const shrimpLifetimeDaly = params.shrimp.life  * params.shrimp.wr  / DAYS_PER_DALY;
+    const henLifetimeDaly    = params.eggs.life    * params.eggs.wr    / DAYS_PER_DALY;
+    const dalyPerShrimpHelped = ce.swpShrimpPerDollar > 0
+      ? swpDalyPerDollar / ce.swpShrimpPerDollar : 0;
+    const dalyPerHenHelped    = ce.cfHensPerDollar > 0
+      ? cfDalyPerDollar / ce.cfHensPerDollar : 0;
+    const swpRatio = shrimpLifetimeDaly > 0
+      ? dalyPerShrimpHelped / shrimpLifetimeDaly : 0;
+    const cfRatio  = henLifetimeDaly > 0
+      ? dalyPerHenHelped    / henLifetimeDaly    : 0;
+
+    return {
+      ch, avoided, added, perPerson, total, spk, breakEven,
+      dalys, swpCost, cfCost, swpDalyPerDollar, cfDalyPerDollar,
+      shrimpLifetimeDaly, henLifetimeDaly,
+      dalyPerShrimpHelped, dalyPerHenHelped,
+      swpRatio, cfRatio,
+    };
+  }, [agsCount, replaceRate, params, ce, includeEggs]);
+
+  // ─── number formatting ───────────────────────────────────────────────
+  const fmt = (n, digits = 2) => {
+    if (!isFinite(n)) return '—';
+    const a = Math.abs(n);
+    if (a >= 1e9)  return (n / 1e9).toFixed(digits)  + 'B';
+    if (a >= 1e6)  return (n / 1e6).toFixed(digits)  + 'M';
+    if (a >= 1e3)  return (n / 1e3).toFixed(1)       + 'k';
+    if (a >= 1)    return n.toFixed(digits);
+    if (a >= 0.01) return n.toFixed(3);
+    if (a === 0)   return '0';
+    return n.toExponential(2);
+  };
+  const fmtSigned = (n, d) => (n >= 0 ? '+' : '') + fmt(n, d);
+
+  // ─── chart data ──────────────────────────────────────────────────────
+  const chartData = [
+    { name: 'Shrimp',        v: calc.ch.shrimp,       hot: true,  group: 'added' },
+    { name: 'Chicken',       v: calc.ch.chicken,      group: 'added' },
+    ...(includeEggs ? [{ name: 'Eggs', v: calc.ch.eggs, group: 'added' }] : []),
+    { name: 'Other seafood', v: calc.ch.otherSeafood, group: 'added' },
+    { name: 'Turkey',        v: calc.ch.turkey,       group: 'added' },
+    { name: 'Pork',          v: calc.ch.pork,         group: 'avoided' },
+    { name: 'Beef',          v: calc.ch.beef,         group: 'avoided' },
+    { name: 'Dairy',         v: calc.ch.dairy,        group: 'avoided' },
+  ];
+
+  // ─── tiny helpers ────────────────────────────────────────────────────
+  const Field = ({ label, hint, children }) => (
+    <div className="mb-5">
+      <div className="flex items-baseline justify-between mb-1.5 gap-3">
+        <label style={{ fontFamily: SERIF, color: COLOR.ink }} className="text-base">
+          {label}
+        </label>
+        {hint && (
+          <span style={{
+            fontFamily: MONO, color: COLOR.inkSoft, fontSize: '0.7rem',
+            textAlign: 'right', maxWidth: '60%', lineHeight: 1.3
+          }}>
+            {hint}
+          </span>
+        )}
+      </div>
+      {children}
+    </div>
+  );
+
+  const NumInput = ({ value, onChange, step = 1, min = 0 }) => (
+    <input
+      type="number"
+      value={value}
+      onChange={e => onChange(parseFloat(e.target.value) || 0)}
+      step={step}
+      min={min}
+      className="w-full px-2 py-1 rounded border outline-none"
+      style={{
+        fontFamily: MONO,
+        background: COLOR.paper,
+        borderColor: COLOR.rule,
+        color: COLOR.ink,
+        fontSize: '0.78rem',
+      }}
+    />
+  );
+
+  const updateParam = (cat, field, v) =>
+    setParams(p => ({ ...p, [cat]: { ...p[cat], [field]: v } }));
+
+  // ─── render ──────────────────────────────────────────────────────────
+  return (
+    <div
+      className="min-h-screen w-full px-5 py-8 md:px-10 md:py-12"
+      style={{
+        background: COLOR.bg,
+        color: COLOR.ink,
+        fontFamily: SERIF,
+        backgroundImage:
+          'radial-gradient(ellipse at top, rgba(255,250,230,0.5), transparent 70%),' +
+          'radial-gradient(ellipse at bottom right, rgba(120,90,40,0.06), transparent 60%)'
+      }}
+    >
+      <div className="max-w-3xl mx-auto">
+
+        {/* ─── HEADER ─── */}
+        <header className="mb-10 border-b pb-7" style={{ borderColor: COLOR.rule }}>
+          <div style={{
+            fontFamily: MONO, fontSize: '0.7rem', letterSpacing: '0.2em',
+            color: COLOR.inkSoft, textTransform: 'uppercase', marginBottom: '0.5rem'
+          }}>
+            Working note · counterfactual welfare · revision 6
+          </div>
+          <h1 style={{
+            fontFamily: SERIF, fontWeight: 600,
+            fontSize: 'clamp(2rem, 5vw, 3rem)',
+            lineHeight: 1.05, letterSpacing: '-0.01em', marginBottom: '0.5rem'
+          }}>
+            <em style={{ fontStyle: 'italic', color: COLOR.highlight }}>α-gal syndrome</em>{' '}
+            and the <span style={{ fontStyle: 'italic' }}>small-animal replacement problem</span>
+          </h1>
+          <p style={{
+            fontFamily: SERIF, fontSize: '1.1rem', lineHeight: 1.5,
+            color: COLOR.inkSoft, maxWidth: '52ch'
+          }}>
+            Suffering accounting using <a href="https://forum.effectivealtruism.org/posts/Qk3hd6PrFManj8K6o/rethink-priorities-welfare-range-estimates"
+              style={{
+                color: COLOR.highlight, textDecoration: 'underline',
+                textDecorationStyle: 'dotted'
+              }}>RP welfare ranges</a>;
+            offset costs via <em>Shrimp Welfare Project</em> and <em>cage-free egg
+            campaigns</em>. Both anchors scale with the user's shrimp / chicken WR.
+          </p>
+        </header>
+
+        {/* ─── INPUTS ─── */}
+        <section className="mb-10 rounded p-6 md:p-8"
+                 style={{ background: COLOR.paper, border: `1px solid ${COLOR.rule}` }}>
+
+          <h2 style={{
+            fontFamily: MONO, fontSize: '0.7rem', letterSpacing: '0.2em',
+            color: COLOR.inkSoft, textTransform: 'uppercase', marginBottom: '1.25rem'
+          }}>§1 — Inputs</h2>
+
+          <Field
+            label="U.S. AGS prevalence (symptomatic, lab-diagnosed)"
+            hint={`default 110k = cumulative lab-diagnosed cases 2010–2022 (Binder et al., MMWR 2023). 450k is CDC extrapolation incl. underdiagnosis.`}
+          >
+            <div className="flex items-center gap-3">
+              <input
+                type="range"
+                min={10000} max={500000} step={5000}
+                value={agsCount}
+                onChange={e => setAgsCount(parseInt(e.target.value))}
+                className="flex-1"
+                style={{ accentColor: COLOR.highlight }}
+              />
+              <input
+                type="number"
+                value={agsCount}
+                onChange={e => setAgsCount(parseInt(e.target.value) || 0)}
+                step={5000} min={0}
+                className="w-32 px-2 py-1 rounded border outline-none text-right"
+                style={{
+                  fontFamily: MONO, background: COLOR.bg,
+                  borderColor: COLOR.rule, color: COLOR.ink, fontSize: '0.9rem'
+                }}
+              />
+            </div>
+          </Field>
+
+          <Field
+            label={
+              <span>
+                Fraction of forgone <em>beef + pork</em> calories that get replaced
+                by allowed animal protein
+              </span>
+            }
+            hint={`replacement allocated to chicken/turkey/shrimp/other seafood in proportion to current US consumption. Dairy is not replaced.`}
+          >
+            <div className="flex items-center gap-3">
+              <input
+                type="range"
+                min={0} max={100} step={1}
+                value={replaceRate}
+                onChange={e => setReplaceRate(parseInt(e.target.value))}
+                className="flex-1"
+                style={{ accentColor: COLOR.highlight }}
+              />
+              <div style={{
+                fontFamily: MONO, fontSize: '1rem',
+                width: '4ch', textAlign: 'right', color: COLOR.ink
+              }}>
+                {replaceRate}%
+              </div>
+            </div>
+          </Field>
+
+          <Field
+            label="Include eggs in the replacement basket"
+            hint={`AGS sufferers are not allergic to eggs (they're a different molecule), but eggs may or may not be a behaviourally salient substitute. Off by default.`}
+          >
+            <button
+              type="button"
+              onClick={() => setIncludeEggs(v => !v)}
+              role="switch"
+              aria-checked={includeEggs}
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: '0.7rem',
+                padding: '0.45rem 0.9rem',
+                fontFamily: MONO, fontSize: '0.78rem',
+                background: includeEggs ? COLOR.highlight : COLOR.bg,
+                color: includeEggs ? COLOR.paper : COLOR.inkSoft,
+                border: `1px solid ${includeEggs ? COLOR.highlight : COLOR.rule}`,
+                borderRadius: 3, cursor: 'pointer',
+                transition: 'all 0.15s ease',
+              }}
+            >
+              <span style={{
+                display: 'inline-block', width: '0.7rem', height: '0.7rem',
+                borderRadius: '50%',
+                background: includeEggs ? COLOR.paper : COLOR.rule,
+              }}/>
+              {includeEggs ? 'eggs included' : 'eggs excluded'}
+            </button>
+          </Field>
+        </section>
+
+        {/* ─── HEADLINE RESULT ─── */}
+        <section className="mb-10 text-center">
+          <div style={{
+            fontFamily: MONO, fontSize: '0.7rem', letterSpacing: '0.2em',
+            color: COLOR.inkSoft, textTransform: 'uppercase', marginBottom: '0.75rem'
+          }}>
+            Net annual change · welfare-adjusted suffering-days · all U.S. AGS sufferers
+          </div>
+          <div style={{
+            fontFamily: SERIF, fontWeight: 600,
+            fontSize: 'clamp(2.8rem, 9vw, 5rem)',
+            lineHeight: 1, letterSpacing: '-0.02em',
+            color: calc.total >= 0 ? COLOR.addedHot : COLOR.avoided
+          }}>
+            {fmtSigned(calc.total, 2)}
+          </div>
+          <div style={{
+            fontFamily: SERIF, fontStyle: 'italic',
+            fontSize: '1.1rem', color: COLOR.inkSoft, marginTop: '0.5rem'
+          }}>
+            human-DALY-equivalent days of farm-animal life per year
+          </div>
+
+          <div className="mt-5 flex justify-center gap-8 flex-wrap"
+               style={{ fontFamily: MONO, fontSize: '0.8rem', color: COLOR.inkSoft }}>
+            <div>
+              avoided{' '}
+              <span style={{ color: COLOR.avoided, fontWeight: 700 }}>
+                {fmt(Math.abs(calc.avoided * agsCount))}
+              </span>
+            </div>
+            <div>
+              added{' '}
+              <span style={{ color: COLOR.added, fontWeight: 700 }}>
+                +{fmt(calc.added * agsCount)}
+              </span>
+            </div>
+            <div>
+              per AGS sufferer{' '}
+              <span style={{ color: COLOR.ink, fontWeight: 700 }}>
+                {fmtSigned(calc.perPerson, 0)}
+              </span>{' '}d/yr
+            </div>
+            <div>
+              break-even{' '}
+              <span style={{ color: COLOR.ink, fontWeight: 700 }}>
+                {calc.breakEven.toFixed(2)}%
+              </span>
+            </div>
+          </div>
+        </section>
+
+        {/* ─── BAR CHART ─── */}
+        <section className="mb-10 rounded p-5 md:p-7"
+                 style={{ background: COLOR.paper, border: `1px solid ${COLOR.rule}` }}>
+          <h2 style={{
+            fontFamily: MONO, fontSize: '0.7rem', letterSpacing: '0.2em',
+            color: COLOR.inkSoft, textTransform: 'uppercase', marginBottom: '0.5rem'
+          }}>
+            §2 — Per-AGS-sufferer breakdown
+          </h2>
+          <p style={{
+            fontFamily: SERIF, fontStyle: 'italic',
+            color: COLOR.inkSoft, fontSize: '0.95rem', marginBottom: '1rem'
+          }}>
+            Welfare-adjusted suffering-days/year added (right) or removed (left)
+            per individual. With RP welfare ranges, shrimp still lead but the
+            gap to chicken is smaller than under Tomasik's coefficients.
+          </p>
+          <div style={{ width: '100%', height: 360 }}>
+            <ResponsiveContainer>
+              <BarChart
+                data={chartData}
+                layout="vertical"
+                margin={{ top: 10, right: 60, bottom: 10, left: 80 }}
+              >
+                <XAxis
+                  type="number"
+                  tick={{ fontFamily: MONO, fontSize: 11, fill: COLOR.inkSoft }}
+                  tickFormatter={v => fmt(v, 0)}
+                  stroke={COLOR.rule}
+                />
+                <YAxis
+                  type="category"
+                  dataKey="name"
+                  tick={{ fontFamily: SERIF, fontSize: 14, fill: COLOR.ink }}
+                  stroke={COLOR.rule}
+                  width={80}
+                />
+                <ReferenceLine x={0} stroke={COLOR.ink} strokeWidth={1} />
+                <Tooltip
+                  cursor={{ fill: COLOR.ruleSoft, opacity: 0.4 }}
+                  contentStyle={{
+                    background: COLOR.paper, border: `1px solid ${COLOR.rule}`,
+                    borderRadius: 4, fontFamily: MONO, fontSize: '0.8rem',
+                  }}
+                  formatter={(v) => [fmtSigned(v, 1) + ' d/yr', 'Δ suffering']}
+                />
+                <Bar dataKey="v" barSize={22}>
+                  {chartData.map((d, i) => (
+                    <Cell key={i}
+                          fill={ d.hot           ? COLOR.addedHot
+                               : d.group === 'added' ? COLOR.added
+                                                     : COLOR.avoided } />
+                  ))}
+                  <LabelList
+                    dataKey="v"
+                    position="right"
+                    formatter={(v) => fmtSigned(v, 0)}
+                    style={{ fontFamily: MONO, fontSize: 10, fill: COLOR.ink }}
+                  />
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </section>
+
+        {/* ─── OFFSET COST ─── */}
+        <section className="mb-10 rounded p-5 md:p-7"
+                 style={{ background: COLOR.paper, border: `1px solid ${COLOR.rule}` }}>
+          <h2 style={{
+            fontFamily: MONO, fontSize: '0.7rem', letterSpacing: '0.2em',
+            color: COLOR.inkSoft, textTransform: 'uppercase', marginBottom: '0.5rem'
+          }}>
+            §3 — What would offsetting cost?
+          </h2>
+          <p style={{
+            fontFamily: SERIF, fontStyle: 'italic',
+            color: COLOR.inkSoft, fontSize: '0.95rem', marginBottom: '1.4rem'
+          }}>
+            {calc.total <= 0
+              ? <>AGS already nets out as suffering-reducing under these assumptions, so no offset is needed. The numbers below would be the cost of <em>doubling</em> the avoided suffering.</>
+              : <>Total annual suffering ≈ <span style={{ fontFamily: MONO, color: COLOR.ink }}>
+                  {fmt(calc.dalys, 1)}</span>{' '}
+                human-DALY-equivalents. Both anchors below scale linearly with the user's
+                shrimp / chicken welfare ranges — change those in §4 and the offset costs update.</>}
+          </p>
+
+          <div className="grid gap-5" style={{
+            gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))'
+          }}>
+            {/* SWP card */}
+            <div style={{
+              background: COLOR.bg, border: `1px solid ${COLOR.rule}`,
+              borderRadius: 4, padding: '1.1rem 1.2rem'
+            }}>
+              <div style={{
+                fontFamily: MONO, fontSize: '0.65rem', letterSpacing: '0.18em',
+                color: COLOR.inkSoft, textTransform: 'uppercase', marginBottom: '0.4rem'
+              }}>
+                via Shrimp Welfare Project (HSI)
+              </div>
+              <div style={{
+                fontFamily: SERIF, fontWeight: 600,
+                fontSize: 'clamp(1.6rem, 4vw, 2.2rem)',
+                lineHeight: 1, color: COLOR.ink, marginBottom: '0.4rem'
+              }}>
+                ${fmt(Math.abs(calc.swpCost), 2)}<span style={{
+                  fontSize: '0.55em', fontWeight: 400, color: COLOR.inkSoft
+                }}>{' '}/ year</span>
+              </div>
+              <div style={{
+                fontFamily: MONO, fontSize: '0.7rem', color: COLOR.inkSoft,
+                lineHeight: 1.5
+              }}>
+                ≈ ${(Math.abs(calc.swpCost) / Math.max(agsCount, 1)).toExponential(1)}{' '}per AGS sufferer<br/>
+                effective CE: {fmt(calc.swpDalyPerDollar, 1)} DALY/$
+              </div>
+            </div>
+
+            {/* Cage-free card */}
+            <div style={{
+              background: COLOR.bg, border: `1px solid ${COLOR.rule}`,
+              borderRadius: 4, padding: '1.1rem 1.2rem'
+            }}>
+              <div style={{
+                fontFamily: MONO, fontSize: '0.65rem', letterSpacing: '0.18em',
+                color: COLOR.inkSoft, textTransform: 'uppercase', marginBottom: '0.4rem'
+              }}>
+                via Cage-free egg campaigns
+              </div>
+              <div style={{
+                fontFamily: SERIF, fontWeight: 600,
+                fontSize: 'clamp(1.6rem, 4vw, 2.2rem)',
+                lineHeight: 1, color: COLOR.ink, marginBottom: '0.4rem'
+              }}>
+                ${fmt(Math.abs(calc.cfCost), 2)}<span style={{
+                  fontSize: '0.55em', fontWeight: 400, color: COLOR.inkSoft
+                }}>{' '}/ year</span>
+              </div>
+              <div style={{
+                fontFamily: MONO, fontSize: '0.7rem', color: COLOR.inkSoft,
+                lineHeight: 1.5
+              }}>
+                ≈ ${(Math.abs(calc.cfCost) / Math.max(agsCount, 1)).toFixed(3)}{' '}per AGS sufferer<br/>
+                effective CE: {fmt(calc.cfDalyPerDollar, 2)} DALY/$
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-5 p-4" style={{
+            background: COLOR.bg, border: `1px dashed ${COLOR.rule}`, borderRadius: 4
+          }}>
+            <div style={{
+              fontFamily: MONO, fontSize: '0.65rem', letterSpacing: '0.18em',
+              color: COLOR.inkSoft, textTransform: 'uppercase', marginBottom: '0.5rem'
+            }}>
+              consistency check · per-individual
+            </div>
+            <p style={{
+              fontFamily: SERIF, fontStyle: 'italic',
+              color: COLOR.inkSoft, fontSize: '0.9rem',
+              marginBottom: '0.6rem', lineHeight: 1.4
+            }}>
+              An intervention can&apos;t avert more DALYs per animal than that animal
+              experiences in its whole lifetime. Ratios should be ≤ 100%.
+            </p>
+            <table style={{
+              fontFamily: MONO, fontSize: '0.72rem', width: '100%',
+              borderCollapse: 'collapse'
+            }}>
+              <thead>
+                <tr style={{ borderBottom: `1px solid ${COLOR.ruleSoft}` }}>
+                  <th style={{ textAlign: 'left',  padding: '0.3rem 0.4rem',
+                               color: COLOR.inkSoft, fontWeight: 600 }}>intervention</th>
+                  <th style={{ textAlign: 'right', padding: '0.3rem 0.4rem',
+                               color: COLOR.inkSoft, fontWeight: 600 }}>averted/animal</th>
+                  <th style={{ textAlign: 'right', padding: '0.3rem 0.4rem',
+                               color: COLOR.inkSoft, fontWeight: 600 }}>lifetime/animal</th>
+                  <th style={{ textAlign: 'right', padding: '0.3rem 0.4rem',
+                               color: COLOR.inkSoft, fontWeight: 600 }}>ratio</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr style={{ borderBottom: `1px solid ${COLOR.ruleSoft}` }}>
+                  <td style={{ padding: '0.3rem 0.4rem',
+                               fontFamily: SERIF, fontSize: '0.9rem', color: COLOR.ink }}>
+                    SWP · per shrimp
+                  </td>
+                  <td style={{ padding: '0.3rem 0.4rem', textAlign: 'right',
+                               color: COLOR.inkSoft }}>
+                    {calc.dalyPerShrimpHelped.toExponential(2)} DALY
+                  </td>
+                  <td style={{ padding: '0.3rem 0.4rem', textAlign: 'right',
+                               color: COLOR.inkSoft }}>
+                    {calc.shrimpLifetimeDaly.toExponential(2)} DALY
+                  </td>
+                  <td style={{
+                    padding: '0.3rem 0.4rem', textAlign: 'right', fontWeight: 700,
+                    color: calc.swpRatio > 1 ? COLOR.addedHot : COLOR.avoided
+                  }}>
+                    {(calc.swpRatio * 100).toFixed(2)}%{calc.swpRatio > 1 ? ' ⚠' : ' ✓'}
+                  </td>
+                </tr>
+                <tr>
+                  <td style={{ padding: '0.3rem 0.4rem',
+                               fontFamily: SERIF, fontSize: '0.9rem', color: COLOR.ink }}>
+                    cage-free · per hen
+                  </td>
+                  <td style={{ padding: '0.3rem 0.4rem', textAlign: 'right',
+                               color: COLOR.inkSoft }}>
+                    {calc.dalyPerHenHelped.toExponential(2)} DALY
+                  </td>
+                  <td style={{ padding: '0.3rem 0.4rem', textAlign: 'right',
+                               color: COLOR.inkSoft }}>
+                    {calc.henLifetimeDaly.toExponential(2)} DALY
+                  </td>
+                  <td style={{
+                    padding: '0.3rem 0.4rem', textAlign: 'right', fontWeight: 700,
+                    color: calc.cfRatio > 1 ? COLOR.addedHot : COLOR.avoided
+                  }}>
+                    {(calc.cfRatio * 100).toFixed(2)}%{calc.cfRatio > 1 ? ' ⚠' : ' ✓'}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <p style={{
+              fontFamily: MONO, fontSize: '0.62rem',
+              color: COLOR.inkSoft, marginTop: '0.6rem', lineHeight: 1.5
+            }}>
+              Lifetime DALY per animal = lifespan × WR / 365.25 (under the same
+              flat-WR scaling as §2). Averted-per-animal = effective DALY/$ ÷
+              individuals helped per $ (edit individuals/$ in §4).
+            </p>
+          </div>
+        </section>
+
+        {/* ─── COEFFICIENT TABLE ─── */}
+        <section className="mb-8">
+          <button
+            onClick={() => setShowCoefs(v => !v)}
+            className="w-full text-left flex items-center justify-between py-2"
+            style={{
+              fontFamily: MONO, fontSize: '0.7rem', letterSpacing: '0.2em',
+              color: COLOR.inkSoft, textTransform: 'uppercase',
+              borderTop: `1px solid ${COLOR.rule}`, borderBottom: `1px solid ${COLOR.rule}`,
+              background: 'transparent', cursor: 'pointer'
+            }}
+          >
+            <span>§4 — Coefficients (consumption · individuals/kg · lifespan · welfare range · CE)</span>
+            <span>{showCoefs ? '−' : '+'}</span>
+          </button>
+
+          {showCoefs && (
+            <div className="mt-4 rounded p-5"
+                 style={{ background: COLOR.paper, border: `1px solid ${COLOR.rule}` }}>
+              <p style={{ fontFamily: SERIF, fontStyle: 'italic',
+                          color: COLOR.inkSoft, fontSize: '0.95rem', marginBottom: '1rem' }}>
+                Suffering/kg derives as <code style={{ fontFamily: MONO, fontSize: '0.85rem' }}>
+                lifespan × indPerKg × welfareRange</code>. Welfare ranges below are RP's
+                50th-percentile, sentience-adjusted estimates (vertebrates). Cows &amp;
+                turkey aren't in RP's species set; defaults follow RP's "vertebrates within ~2×"
+                guidance.
+              </p>
+              <div className="overflow-x-auto">
+                <table style={{ fontFamily: MONO, fontSize: '0.78rem', width: '100%',
+                                borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ borderBottom: `1px solid ${COLOR.rule}` }}>
+                      <th style={{ textAlign: 'left',  padding: '0.4rem 0.4rem',
+                                   fontWeight: 600, color: COLOR.inkSoft }}>category</th>
+                      <th style={{ textAlign: 'right', padding: '0.4rem 0.4rem',
+                                   fontWeight: 600, color: COLOR.inkSoft }}>kg/yr</th>
+                      <th style={{ textAlign: 'right', padding: '0.4rem 0.4rem',
+                                   fontWeight: 600, color: COLOR.inkSoft }}>ind/kg</th>
+                      <th style={{ textAlign: 'right', padding: '0.4rem 0.4rem',
+                                   fontWeight: 600, color: COLOR.inkSoft }}>lifespan&nbsp;(d)</th>
+                      <th style={{ textAlign: 'right', padding: '0.4rem 0.4rem',
+                                   fontWeight: 600, color: COLOR.inkSoft }}>welfare&nbsp;range</th>
+                      <th style={{ textAlign: 'right', padding: '0.4rem 0.4rem',
+                                   fontWeight: 600, color: COLOR.inkSoft }}>=&nbsp;d/kg</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.keys(DEFAULTS).map(k => {
+                      const p = params[k];
+                      const isInactive = k === 'eggs' && !includeEggs;
+                      return (
+                        <tr key={k} style={{
+                          borderBottom: `1px solid ${COLOR.ruleSoft}`,
+                          opacity: isInactive ? 0.45 : 1,
+                        }}>
+                          <td style={{
+                            padding: '0.4rem 0.4rem',
+                            fontFamily: SERIF, fontSize: '0.95rem', color: COLOR.ink
+                          }}>
+                            {k.replace(/([A-Z])/g, ' $1')}
+                            {isInactive && (
+                              <span style={{
+                                fontFamily: MONO, fontSize: '0.65rem',
+                                color: COLOR.inkSoft, marginLeft: '0.4rem'
+                              }}>
+                                (off)
+                              </span>
+                            )}
+                          </td>
+                          <td style={{ padding: '0.3rem 0.3rem' }}>
+                            <NumInput value={p.c} step={0.1}
+                                      onChange={v => updateParam(k, 'c', v)} />
+                          </td>
+                          <td style={{ padding: '0.3rem 0.3rem' }}>
+                            <NumInput value={p.ind}
+                                      step={p.ind > 1 ? 0.1 : 0.0001}
+                                      onChange={v => updateParam(k, 'ind', v)} />
+                          </td>
+                          <td style={{ padding: '0.3rem 0.3rem' }}>
+                            <NumInput value={p.life} step={1}
+                                      onChange={v => updateParam(k, 'life', v)} />
+                          </td>
+                          <td style={{ padding: '0.3rem 0.3rem' }}>
+                            <NumInput value={p.wr} step={0.001}
+                                      onChange={v => updateParam(k, 'wr', v)} />
+                          </td>
+                          <td style={{
+                            padding: '0.4rem 0.4rem', textAlign: 'right',
+                            color: COLOR.inkSoft, fontVariantNumeric: 'tabular-nums'
+                          }}>
+                            {fmt(calc.spk[k], 2)}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* CE inputs */}
+              <div className="mt-5 pt-4" style={{ borderTop: `1px solid ${COLOR.ruleSoft}` }}>
+                <div style={{
+                  fontFamily: MONO, fontSize: '0.65rem', letterSpacing: '0.18em',
+                  color: COLOR.inkSoft, textTransform: 'uppercase', marginBottom: '0.6rem'
+                }}>
+                  cost-effectiveness anchors (ACE / Welfare Footprint)
+                </div>
+                <div className="grid gap-4" style={{
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))'
+                }}>
+                  <div>
+                    <label style={{
+                      fontFamily: SERIF, fontSize: '0.95rem',
+                      color: COLOR.ink, display: 'block', marginBottom: '0.25rem'
+                    }}>
+                      SWP, DALY/$ at WR=1{' '}
+                      <span style={{
+                        fontFamily: MONO, fontSize: '0.7rem', color: COLOR.inkSoft
+                      }}>(scales × WR<sub>shrimp</sub>)</span>
+                    </label>
+                    <NumInput value={ce.swpAtWR1} step={0.5}
+                              onChange={v => setCe(c => ({ ...c, swpAtWR1: v }))} />
+                    <div style={{
+                      fontFamily: MONO, fontSize: '0.65rem',
+                      color: COLOR.inkSoft, marginTop: '0.25rem'
+                    }}>
+                      = {fmt(calc.swpDalyPerDollar, 3)} DALY/$ at current WR
+                    </div>
+                  </div>
+                  <div>
+                    <label style={{
+                      fontFamily: SERIF, fontSize: '0.95rem',
+                      color: COLOR.ink, display: 'block', marginBottom: '0.25rem'
+                    }}>
+                      Cage-free, DALY/$ at WR=1{' '}
+                      <span style={{
+                        fontFamily: MONO, fontSize: '0.7rem', color: COLOR.inkSoft
+                      }}>(scales × WR<sub>chicken</sub>)</span>
+                    </label>
+                    <NumInput value={ce.cfAtWR1} step={0.1}
+                              onChange={v => setCe(c => ({ ...c, cfAtWR1: v }))} />
+                    <div style={{
+                      fontFamily: MONO, fontSize: '0.65rem',
+                      color: COLOR.inkSoft, marginTop: '0.25rem'
+                    }}>
+                      = {fmt(calc.cfDalyPerDollar, 3)} DALY/$ at current WR
+                    </div>
+                  </div>
+                  <div>
+                    <label style={{
+                      fontFamily: SERIF, fontSize: '0.95rem',
+                      color: COLOR.ink, display: 'block', marginBottom: '0.25rem'
+                    }}>
+                      SWP, shrimp helped per $
+                    </label>
+                    <NumInput value={ce.swpShrimpPerDollar} step={500}
+                              onChange={v => setCe(c => ({ ...c, swpShrimpPerDollar: v }))} />
+                    <div style={{
+                      fontFamily: MONO, fontSize: '0.65rem',
+                      color: COLOR.inkSoft, marginTop: '0.25rem'
+                    }}>
+                      → {calc.dalyPerShrimpHelped.toExponential(2)} DALY/shrimp
+                    </div>
+                  </div>
+                  <div>
+                    <label style={{
+                      fontFamily: SERIF, fontSize: '0.95rem',
+                      color: COLOR.ink, display: 'block', marginBottom: '0.25rem'
+                    }}>
+                      Cage-free, hens helped per $
+                    </label>
+                    <NumInput value={ce.cfHensPerDollar} step={1}
+                              onChange={v => setCe(c => ({ ...c, cfHensPerDollar: v }))} />
+                    <div style={{
+                      fontFamily: MONO, fontSize: '0.65rem',
+                      color: COLOR.inkSoft, marginTop: '0.25rem'
+                    }}>
+                      → {calc.dalyPerHenHelped.toExponential(2)} DALY/hen
+                    </div>
+                  </div>
+                </div>
+                <p style={{
+                  fontFamily: SERIF, fontStyle: 'italic',
+                  fontSize: '0.85rem', color: COLOR.inkSoft,
+                  marginTop: '0.85rem', lineHeight: 1.4
+                }}>
+                  SWP DALY/$ derived from ACE&apos;s 48 SADs/$ ÷ 365.25 ÷ 0.031.
+                  SWP shrimp/$ from ACE CEA mid-range (9,282–11,602). Cage-free
+                  numbers default to a conservative reading: THL&apos;s recent
+                  ~2 hens/$ estimate × 25%-of-WR averted across hen-years would put
+                  this at ~0.5 DALY/$ at WR=1; using Šimčikas&apos;s mean of
+                  42 hens/$ would push it closer to 5 DALY/$ at WR=1.
+                </p>
+              </div>
+
+              <div className="mt-3 flex justify-end">
+                <button
+                  onClick={() => { setParams(DEFAULTS); setCe(CE_DEFAULTS); }}
+                  style={{
+                    fontFamily: MONO, fontSize: '0.7rem',
+                    color: COLOR.highlight, background: 'transparent',
+                    border: `1px solid ${COLOR.rule}`, padding: '0.3rem 0.6rem',
+                    borderRadius: 3, cursor: 'pointer',
+                  }}
+                >
+                  reset to defaults
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
+
+        {/* ─── METHODOLOGY ─── */}
+        <section className="mb-12">
+          <button
+            onClick={() => setShowMethod(v => !v)}
+            className="w-full text-left flex items-center justify-between py-2"
+            style={{
+              fontFamily: MONO, fontSize: '0.7rem', letterSpacing: '0.2em',
+              color: COLOR.inkSoft, textTransform: 'uppercase',
+              borderTop: `1px solid ${COLOR.rule}`, borderBottom: `1px solid ${COLOR.rule}`,
+              background: 'transparent', cursor: 'pointer'
+            }}
+          >
+            <span>§5 — Method, sources &amp; load-bearing assumptions</span>
+            <span>{showMethod ? '−' : '+'}</span>
+          </button>
+
+          {showMethod && (
+            <div className="mt-4 rounded p-6"
+                 style={{
+                   background: COLOR.paper, border: `1px solid ${COLOR.rule}`,
+                   fontFamily: SERIF, fontSize: '1rem', lineHeight: 1.55, color: COLOR.ink
+                 }}>
+
+              <h3 style={{ fontFamily: SERIF, fontWeight: 600,
+                           fontStyle: 'italic', marginBottom: '0.6rem' }}>
+                Model
+              </h3>
+              <p style={{ marginBottom: '0.9rem', color: COLOR.inkSoft }}>
+                For each AGS sufferer, set per-capita beef, pork &amp; dairy
+                consumption to <em>zero</em>. A user-set fraction of the forgone
+                <em> beef+pork</em> kg is replaced by allowed animal protein
+                (chicken, turkey, shrimp, other seafood; optionally eggs),
+                allocated in proportion to current U.S. consumption. Dairy is
+                not replaced. Eggs are off by default — AGS sufferers can
+                eat them, but whether they actually substitute eggs <em>for</em>{' '}
+                meat (rather than just keeping their current egg habits) is a
+                separate behavioural question. For each category compute{' '}
+                <code style={{ fontFamily: MONO, fontSize: '0.9em' }}>
+                  Δkg × lifespan × indPerKg × welfareRange
+                </code>{' '}
+                and sum.
+              </p>
+
+              <h3 style={{ fontFamily: SERIF, fontWeight: 600,
+                           fontStyle: 'italic', marginBottom: '0.6rem' }}>
+                AGS prevalence
+              </h3>
+              <p style={{ marginBottom: '0.9rem', color: COLOR.inkSoft }}>
+                Default <strong style={{ color: COLOR.ink }}>110,000</strong> = cumulative
+                US lab-diagnosed cases 2010–2022 (Binder et al., MMWR 72(30), 2023).
+                Underlying surveillance shows ~90% of seropositives in clinical
+                populations are symptomatic, so this is a defensible
+                <em> symptomatic</em> floor. The widely-cited{' '}
+                <strong style={{ color: COLOR.ink }}>450,000</strong> figure
+                (Thompson et al., MMWR 2023) is a CDC extrapolation that adjusts upward
+                for under-testing, not a count of clinical cases. Slide up if you
+                want the upper bound.
+              </p>
+
+              <h3 style={{ fontFamily: SERIF, fontWeight: 600,
+                           fontStyle: 'italic', marginBottom: '0.6rem' }}>
+                Welfare ranges
+              </h3>
+              <p style={{ marginBottom: '0.5rem', color: COLOR.inkSoft }}>
+                From <a href="https://forum.effectivealtruism.org/posts/Qk3hd6PrFManj8K6o/rethink-priorities-welfare-range-estimates"
+                  style={{ color: COLOR.highlight }}>Rethink Priorities (Fischer 2023)</a>,
+                50th-percentile, sentience-adjusted, on a scale where 1 = human:
+              </p>
+              <ul style={{ paddingLeft: '1.4rem', color: COLOR.inkSoft,
+                           fontSize: '0.95rem', marginBottom: '0.9rem' }}>
+                <li>Pigs 0.515 · Chickens 0.332 · Salmon 0.056 · Carp 0.089 · Shrimp 0.031</li>
+                <li>Cows: not in RP's set. Default 0.5 ≈ pigs, per RP's "vertebrates within ~2×" claim.</li>
+                <li>Turkey: default 0.332 ≈ chicken.</li>
+                <li>Other seafood: default 0.073 (mid of carp &amp; salmon, finfish proxy).</li>
+              </ul>
+
+              <h3 style={{ fontFamily: SERIF, fontWeight: 600,
+                           fontStyle: 'italic', marginBottom: '0.6rem' }}>
+                Offset-cost conversion
+              </h3>
+              <p style={{ marginBottom: '0.4rem', color: COLOR.inkSoft }}>
+                Suffering-days → DALYs (÷ 365.25) → $ via:
+              </p>
+              <ul style={{ paddingLeft: '1.4rem', color: COLOR.inkSoft,
+                           fontSize: '0.95rem', marginBottom: '0.6rem' }}>
+                <li>
+                  <strong style={{ color: COLOR.ink }}>SWP HSI ≈ 4 DALY/$ at WR = 1</strong>:
+                  derived from <a href="https://animalcharityevaluators.org/charity-review/shrimp-welfare-project/"
+                    style={{ color: COLOR.highlight }}>ACE's published 48 SADs/$</a>{' '}
+                  ÷ 365.25 ÷ 0.031 ≈ 4.23. Scales with WR<sub>shrimp</sub>.
+                </li>
+                <li>
+                  <strong style={{ color: COLOR.ink }}>Cage-free ≈ 0.5 DALY/$ at WR = 1</strong>:
+                  conservative reading consistent with The Humane League's recent
+                  ~2 hens/$ estimate × ~25%-of-welfare-range averted across hen-years.
+                  More aggressive estimates exist —{' '}
+                  <a href="https://forum.effectivealtruism.org/posts/L5EZjjXKdNgcm253H/corporate-campaigns-affect-9-to-120-years-of-chicken-life"
+                    style={{ color: COLOR.highlight }}>Šimčikas (2019)</a> arrives at
+                  9–120 chicken-years/$ which would push the anchor closer to 5 DALY/$
+                  at WR = 1. Scales with WR<sub>chicken</sub>.
+                </li>
+              </ul>
+              <p style={{ marginBottom: '0.9rem', color: COLOR.inkSoft }}>
+                <strong style={{ color: COLOR.ink }}>Internal consistency:</strong>{' '}
+                under flat-WR scaling (§2), an animal&apos;s lifetime DALYs cap how
+                much an intervention can avert per animal helped. The §3 sanity-check
+                table reports the ratio. With these defaults, both ratios sit well
+                under 100% (SWP ≈ 0.1%, cage-free ≈ 1%), as expected for interventions
+                that improve part of a farm-animal&apos;s life rather than the whole
+                of it. If you raise the DALY/$ anchors substantially without also
+                lowering the per-$ animals helped, the ratios will exceed 100% and
+                flag inconsistency — that means the implied per-animal averted
+                suffering is bigger than the whole life under the current welfare-range
+                framework, which only makes sense under a non-flat pain-intensity
+                weighting that this widget doesn&apos;t apply elsewhere.
+              </p>
+
+              <h3 style={{ fontFamily: SERIF, fontWeight: 600,
+                           fontStyle: 'italic', marginBottom: '0.6rem' }}>
+                Load-bearing assumptions
+              </h3>
+              <ol style={{ paddingLeft: '1.4rem', marginBottom: '0.9rem',
+                           color: COLOR.inkSoft }}>
+                <li style={{ marginBottom: '0.4rem' }}>
+                  <strong style={{ color: COLOR.ink }}>"Lives at full negative welfare range"</strong>{' '}
+                  is implicit in using the welfare range directly as the multiplier.
+                  In reality animals don't experience peak suffering 100% of the time;
+                  the right adjustment is some "fraction-of-range-realised" factor &lt;1.
+                  Halving every welfare-range entry halves the headline. RP's BOTEC
+                  spreadsheet (linked from Fischer 2023) is the canonical place to
+                  layer this in.
+                </li>
+                <li style={{ marginBottom: '0.4rem' }}>
+                  <strong style={{ color: COLOR.ink }}>RP welfare ranges
+                  ≠ "moral weight."</strong> They estimate the <em>capacity</em> for
+                  positive/negative experience, not all-things-considered priority.
+                  Under hierarchicalist views the implied trade-offs would shift.
+                </li>
+                <li style={{ marginBottom: '0.4rem' }}>
+                  <strong style={{ color: COLOR.ink }}>Strict avoidance.</strong> Real
+                  AGS severity is a spectrum; this gives an upper bound on the
+                  dietary delta per sufferer.
+                </li>
+                <li style={{ marginBottom: '0.4rem' }}>
+                  <strong style={{ color: COLOR.ink }}>Lamb ignored.</strong> ~0.6 kg /
+                  person / yr; rolling into beef would shift results &lt;3%.
+                </li>
+                <li style={{ marginBottom: '0.4rem' }}>
+                  <strong style={{ color: COLOR.ink }}>Other seafood = farmed fish proxy.</strong>{' '}
+                  Most US "other seafood" is actually wild-caught (tuna, pollock, cod);
+                  modelling it as farmed salmon-equivalents likely <em>over</em>states the
+                  added farm suffering for that bucket.
+                </li>
+                <li style={{ marginBottom: '0.4rem' }}>
+                  <strong style={{ color: COLOR.ink }}>No price-elasticity correction.</strong>{' '}
+                  A kg not bought ≠ a kg not produced. ACE/CEFs are typically
+                  0.3–0.9; multiply the headline by your preferred CEF for a
+                  defensible market-corrected number. The sign is preserved.
+                </li>
+                <li style={{ marginBottom: '0.4rem' }}>
+                  <strong style={{ color: COLOR.ink }}>Indirect effects ignored.</strong>{' '}
+                  Beef may reduce wild-animal suffering on net via grazing
+                  (Tomasik); fishing arguably reduces wild fish populations.
+                  Neither is in the model.
+                </li>
+                <li style={{ marginBottom: '0.4rem' }}>
+                  <strong style={{ color: COLOR.ink }}>Substitution mix.</strong>{' '}
+                  Replacement basket = current US consumption shares. Real AGS
+                  sufferers likely shift more toward plant-based than the average
+                  American, so this overstates added suffering.
+                </li>
+              </ol>
+
+              <h3 style={{ fontFamily: SERIF, fontWeight: 600,
+                           fontStyle: 'italic', marginBottom: '0.6rem' }}>
+                Sources
+              </h3>
+              <ul style={{ paddingLeft: '1.4rem', color: COLOR.inkSoft,
+                           fontSize: '0.95rem' }}>
+                <li>USDA ERS — per-capita meat &amp; dairy availability (2024–25).</li>
+                <li>NOAA / NFI — US seafood per-capita consumption by species.</li>
+                <li>Binder et al., MMWR 72(30), 2023 — AGS lab-diagnosed cumulative cases.</li>
+                <li>Thompson et al., MMWR 72(30), 2023 — AGS extrapolated prevalence (~450k).</li>
+                <li>Fischer, Rethink Priorities (2023) —{' '}
+                  <em>Welfare Range Estimates</em>, Moral Weight Project.</li>
+                <li>Animal Charity Evaluators (2025) — Shrimp Welfare Project charity review (48 SADs/$).</li>
+                <li>Welfare Footprint Project — pain-intensity framework underlying SADs.</li>
+                <li>Šimčikas (2019, EAF / Rethink Priorities) — corporate campaigns affect 9–120 chicken-years per $.</li>
+                <li>Tomasik (2018) — lifespan / yield bookkeeping.</li>
+                <li>Peters / Sokk — foodimpacts.org methodology.</li>
+              </ul>
+            </div>
+          )}
+        </section>
+
+        <footer style={{
+          fontFamily: MONO, fontSize: '0.65rem',
+          color: COLOR.inkSoft, textAlign: 'center',
+          borderTop: `1px solid ${COLOR.rule}`, paddingTop: '1rem'
+        }}>
+          rev. 6 · ACE/WFP throughout, with per-individual sanity check ·
+          numbers illustrative, not policy-load-bearing
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+
+// Mount.
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<AlphaGalCalculator />);
+</script>
+</body>
+</html>
